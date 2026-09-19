@@ -66,6 +66,11 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Config .\watchdog-config
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 ```
 
+**The scheduled task runs completely invisibly.** `install.ps1` launches it through
+`hidden-runner.vbs`, because on Windows 11 (where Windows Terminal is the default terminal host)
+a task using `powershell -WindowStyle Hidden` still flashes a terminal window on every run — one
+window per interval, forever.
+
 ## Configuration
 
 `watchdog-config.json` — all keys optional, see `config.example.json`:

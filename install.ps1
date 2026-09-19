@@ -52,13 +52,20 @@ if ($Uninstall) {
     return
 }
 
-$arguments = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $watchdog
+# Run through the windowless VBS launcher: on Windows 11 (where Windows Terminal is the
+# default terminal host) "powershell -WindowStyle Hidden" still flashes a terminal window on
+# every run. wscript has no console of its own and hides the child's console window.
+$runner = Join-Path $scriptDir 'hidden-runner.vbs'
+if (-not (Test-Path -LiteralPath $runner)) { throw "hidden-runner.vbs is missing next to this installer: $runner" }
+$parts = @('"{0}"' -f $runner, '"{0}"' -f $watchdog)
 if ($Config) {
     if (-not (Test-Path -LiteralPath $Config)) { throw "Config not found: $Config" }
-    $arguments += ' -Config "{0}"' -f (Resolve-Path -LiteralPath $Config).Path
+    $parts += '-Config'
+    $parts += '"{0}"' -f (Resolve-Path -LiteralPath $Config).Path
 }
+$arguments = $parts -join ' '
 
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
+$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument $arguments
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
                                    -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
