@@ -1,0 +1,6 @@
+watchdog.log
+watchdog-config.json
+public-url.txt
+tunnel.log
+watchdog-off.txt
+tests-last-run.txt

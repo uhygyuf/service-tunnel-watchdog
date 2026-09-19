@@ -1,0 +1,39 @@
+{
+  "_comment": "Copy to watchdog-config.json next to watchdog.ps1. Every key is optional; missing keys keep the built-in defaults.",
+
+  "_logFile": "Where decisions are appended (trimmed to the last 200 lines past 200 KB).",
+  "logFile": "watchdog.log",
+
+  "_urlFile": "Receives the current public URL after a repair (empty if never repaired). Delete or set to null to disable.",
+  "urlFile": "public-url.txt",
+
+  "_offSwitch": "If this file exists, every scan exits immediately. Absolute or relative to the script.",
+  "offSwitch": "watchdog-off.txt",
+
+  "_cooldown": "Never repair twice within this many minutes - stops restart storms on a flapping network.",
+  "minMinutesBetweenRestarts": 8,
+
+  "_urlWaitSeconds": "How long to wait for the tunnel to announce its public URL.",
+  "urlWaitSeconds": 60,
+
+  "_bootWaitSeconds": "How long to wait for the service to listen after a restart.",
+  "bootWaitSeconds": 90,
+
+  "_service": "The thing being kept alive.",
+  "service": {
+    "port": 5678,
+    "launcher": "C:\path\to\start-service.bat",
+    "args": [],
+    "urlEnvVar": "SERVICE_PUBLIC_URL",
+    "healthPath": "/"
+  },
+
+  "_tunnel": "The public entry point. Placeholders: {port} {logfile} {url}",
+  "tunnel": {
+    "exe": "cloudflared.exe",
+    "args": ["tunnel", "--url", "http://localhost:{port}", "--protocol", "http2", "--no-autoupdate", "--logfile", "{logfile}"],
+    "processName": "cloudflared",
+    "urlPattern": "https://[a-z0-9-]+\.trycloudflare\.com",
+    "logFile": "tunnel.log"
+  }
+}

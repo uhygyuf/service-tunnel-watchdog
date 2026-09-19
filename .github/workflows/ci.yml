@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: PowerShell syntax check (every .ps1)
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { $failed = $true; Write-Host "::error file=$($_.Name)::$($errors[0].Message)" }
+            else { Write-Host "ok: $($_.Name)" }
+          }
+          if ($failed) { exit 1 }
+
+      - name: PSScriptAnalyzer (errors only)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $issues = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+          $issues | Format-Table -AutoSize
+          if ($issues.Count -gt 0) { exit 1 }
+
+      - name: Self tests (real processes, sandboxed)
+        shell: pwsh
+        run: .\tests\run-tests.ps1
