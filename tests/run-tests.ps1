@@ -250,6 +250,113 @@ Record 'control-char path is caught and falls back' ($out11 -match 'control char
        'loud warning instead of silent write failures'
 Stop-Sandbox $r11
 
+# --- alerts + crash recovery (T12-T16) -------------------------------------
+# A local sink stands in for the Telegram Bot API so the alert path can be tested
+# end to end without touching the network or a real chat.
+function New-AlertSink([string]$root, [int]$port) {
+    $out = Join-Path $root 'alerts.txt'
+    $sink = @'
+param([int]$Port,[string]$OutFile)
+$l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+$l.Start()
+while ($true) {
+    $c = $l.AcceptTcpClient(); $st = $c.GetStream()
+    $sb = New-Object System.Text.StringBuilder
+    $deadline = (Get-Date).AddSeconds(2)
+    while ((Get-Date) -lt $deadline) {
+        if ($st.DataAvailable) {
+            $buf = New-Object byte[] 4096
+            $n = $st.Read($buf, 0, $buf.Length)
+            if ($n -gt 0) { [void]$sb.Append([System.Text.Encoding]::UTF8.GetString($buf, 0, $n)) }
+        } else { Start-Sleep -Milliseconds 50 }
+    }
+    Add-Content -LiteralPath $OutFile -Value ($sb.ToString() -replace "`r?`n", ' | ')
+    $json = '{"ok":true,"result":{"message_id":42}}'
+    $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($json.Length)`r`nConnection: close`r`n`r`n"
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($head + $json)
+    $st.Write($bytes, 0, $bytes.Length); $st.Flush(); $c.Close()
+}
+'@
+    Set-Content -LiteralPath (Join-Path $root 'alert-sink.ps1') -Value $sink -Encoding ASCII
+    Start-Process -FilePath 'powershell' -WindowStyle Hidden -ArgumentList `
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $root 'alert-sink.ps1'), `
+        '-Port', $port, '-OutFile', $out | Out-Null
+    for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Milliseconds 500; if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { break } }
+    return $out
+}
+function Set-Notify([string]$root, [int]$port, [object]$autoStart, [string]$token) {
+    $cfg = Get-Content -LiteralPath (Join-Path $root 'watchdog-config.json') -Raw | ConvertFrom-Json
+    $cfg | Add-Member -NotePropertyName autoStart -NotePropertyValue $autoStart -Force
+    $cfg | Add-Member -NotePropertyName notify -NotePropertyValue ([pscustomobject]@{
+        enabled      = $true
+        apiBase      = "http://127.0.0.1:$port"
+        botToken     = ''
+        chatId       = ''
+        secretsFile  = (Join-Path $root 'watchdog-secrets.json')
+        remindMinutes = 60
+    }) -Force
+    $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'watchdog-config.json') -Encoding UTF8
+    if ($token) {
+        ('{ "botToken": "' + $token + '", "chatId": "999" }') |
+            Set-Content -LiteralPath (Join-Path $root 'watchdog-secrets.json') -Encoding UTF8
+    }
+}
+
+# --- T12: service down with autoStart off stays down, and says so ----------
+$r12 = New-Sandbox 't12' 45812
+Set-Notify $r12 45912 $false ''
+Invoke-Watchdog $r12
+Record 'autoStart off: a dead service stays dead' (((Read-Log $r12) -match 'autoStart is off') -and (@(LauncherRuns $r12).Count -eq 0)) `
+       'crash recovery stays opt-in'
+Stop-Sandbox $r12
+
+# --- T13: autoStart on -> the watchdog brings the service back -------------
+$r13 = New-Sandbox 't13' 45813
+Set-Notify $r13 45913 $true ''
+Invoke-Watchdog $r13
+$log13 = Read-Log $r13
+$runs13 = @(LauncherRuns $r13)
+Record 'autoStart on: a dead service is started again' (($log13 -match 'repaired: service started again') -and ($runs13.Count -ge 1)) `
+       "launcher runs: $($runs13.Count)"
+Record 'the restarted service gets the public URL' (($runs13.Count -ge 1) -and ($runs13[-1].Trim() -eq 'https://t13-tunnel.test')) `
+       "SERVICE_PUBLIC_URL = $($runs13[-1])"
+Stop-Sandbox $r13
+
+# --- T14: repair is announced out-of-band, and never leaks the token -------
+$r14 = New-Sandbox 't14' 45814
+$sink14 = New-AlertSink $r14 45914
+Set-Notify $r14 45914 $true 'FAKE-TOKEN-ABCDE'
+Invoke-Watchdog $r14
+$log14 = Read-Log $r14
+$al14 = ''
+if (Test-Path -LiteralPath $sink14) { $al14 = (Get-Content -LiteralPath $sink14 -Raw) }
+Record 'repair sends an out-of-band alert' (($log14 -match 'alert sent') -and ($al14 -match 'DOWN') -and ($al14 -match 'sendMessage')) `
+       'posted straight to the bot API, not through the watched service'
+Record 'the bot token never reaches the log' (-not ($log14 -match 'FAKE-TOKEN-ABCDE')) `
+       'token read from the secrets file only'
+Stop-Sandbox $r14
+
+# --- T15: repeated alerts are rate limited ---------------------------------
+$r15 = New-Sandbox 't15' 45815
+$sink15 = New-AlertSink $r15 45915
+Set-Notify $r15 45915 $false 'FAKE-TOKEN-FGHIJ'
+Invoke-Watchdog $r15
+Invoke-Watchdog $r15
+$log15 = Read-Log $r15
+$count15 = 0
+if (Test-Path -LiteralPath $sink15) { $count15 = @(Get-Content -LiteralPath $sink15 | Where-Object { $_ -match 'sendMessage' }).Count }
+Record 'repeated alerts are rate limited' (($log15 -match 'alert suppressed') -and ($count15 -eq 1)) `
+       "alerts delivered: $count15"
+Stop-Sandbox $r15
+
+# --- T16: notify enabled but no credentials -> degraded, not fatal ---------
+$r16 = New-Sandbox 't16' 45816
+Set-Notify $r16 45916 $false ''
+Invoke-Watchdog $r16
+Record 'notify without credentials degrades loudly' ((Read-Log $r16) -match 'no bot token / chat id configured') `
+       'logged instead of throwing'
+Stop-Sandbox $r16
+
 # --- cleanup ---------------------------------------------------------------
 Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue

@@ -10,7 +10,9 @@
 
     This watchdog repairs exactly that, on a schedule:
 
-      * service not running            -> does nothing (no surprise autostart)
+      * service not running            -> does nothing by default (no surprise autostart);
+                                          with `autoStart: true` it starts the service
+                                          again (and the tunnel, if that is gone too)
       * tunnel process gone            -> start a new tunnel, read the new public URL,
                                           restart the service with that URL in an
                                           environment variable, log it
@@ -22,12 +24,21 @@
     per scheduled-task run, every decision written to a log, a file-based off switch,
     and an anti-flapping guard so a broken network cannot cause restart storms.
 
+    `autoStart` is about crash recovery, not about starting at Windows boot: the script
+    only runs when the scheduled task runs, which is exactly why it can be enabled
+    without turning the machine into a service host.
+
+    Alerts are sent by this script itself, straight to the Telegram Bot API - never
+    through the service it watches, because a dead service cannot report its own death.
+    The bot token lives in a separate secrets file (not in the shareable config) and is
+    never written to the log.
+
 .PARAMETER Config
     JSON config file. Defaults to watchdog-config.json next to this script; any key
     you omit falls back to the built-in defaults shown in config.example.json.
 
 .PARAMETER DryRun
-    Report what would be done without touching any process.
+    Report what would be done without touching any process (and without sending alerts).
 
 .PARAMETER Verbose
     Also print the decisions to the console.
@@ -65,6 +76,7 @@ $defaults = [ordered]@{
     urlWaitSeconds            = 60
     bootWaitSeconds           = 90
     healthTimeoutSeconds      = 20
+    autoStart                 = $false
     service                   = [ordered]@{
         port      = 5678
         launcher  = ''
@@ -78,6 +90,14 @@ $defaults = [ordered]@{
         processName = 'cloudflared'
         urlPattern  = 'https://[a-z0-9-]+\.trycloudflare\.com'
         logFile     = (Join-Path $scriptDir 'tunnel.log')
+    }
+    notify                    = [ordered]@{
+        enabled       = $false
+        apiBase       = 'https://api.telegram.org'
+        botToken      = ''
+        chatId        = ''
+        secretsFile   = (Join-Path $scriptDir 'watchdog-secrets.json')
+        remindMinutes = 60
     }
 }
 
@@ -140,6 +160,7 @@ function Repair-Path([object]$value, [string]$fallback, [string]$name) {
 
 $serviceCfg = $cfg['service']
 $tunnelCfg  = $cfg['tunnel']
+$notifyCfg  = $cfg['notify']
 $logPath    = Repair-Path $cfg['logFile']  (Join-Path $scriptDir 'watchdog.log')    'logFile'
 $cfg['urlFile'] = Repair-Path $cfg['urlFile'] (Join-Path $scriptDir 'public-url.txt') 'urlFile'
 $offPath    = Repair-Path $cfg['offSwitch'] (Join-Path $scriptDir 'watchdog-off.txt') 'offSwitch'
@@ -147,6 +168,10 @@ if (-not [System.IO.Path]::IsPathRooted($offPath)) { $offPath = Join-Path $scrip
 $tunnelLog  = Repair-Path $tunnelCfg['logFile'] (Join-Path $scriptDir 'tunnel.log')  'tunnel.logFile'
 if (-not [System.IO.Path]::IsPathRooted($tunnelLog)) { $tunnelLog = Join-Path $scriptDir $tunnelLog }
 $tunnelCfg['logFile'] = $tunnelLog
+$notifyCfg['secretsFile'] = Repair-Path $notifyCfg['secretsFile'] (Join-Path $scriptDir 'watchdog-secrets.json') 'notify.secretsFile'
+if (-not [System.IO.Path]::IsPathRooted([string]$notifyCfg['secretsFile'])) {
+    $notifyCfg['secretsFile'] = Join-Path $scriptDir ([string]$notifyCfg['secretsFile'])
+}
 
 function Write-Log([string]$m) {
     if ($VerbosePreference -ne 'SilentlyContinue') { Write-Verbose $m }
@@ -204,11 +229,7 @@ function Start-Tunnel {
     }
     return $null
 }
-function Restart-Service([string]$url) {
-    $svcPid = Get-ServicePid
-    if ($DryRun) { Write-Log "DRY-RUN would restart the service with $($serviceCfg['urlEnvVar'])=$url"; return }
-    if ($svcPid) { Stop-Process -Id $svcPid -Force }
-    Start-Sleep -Seconds 4
+function Start-ServiceProcess([string]$url) {
     if ($serviceCfg['urlEnvVar']) { Set-Item -Path ("env:" + $serviceCfg['urlEnvVar']) -Value $url }
     $svcArgs = @(Expand-Args $serviceCfg['args'] $url)
     if ($svcArgs.Count -gt 0) {
@@ -220,6 +241,13 @@ function Restart-Service([string]$url) {
         Start-Sleep -Seconds 5
         if (Get-ServicePid) { break }
     }
+}
+function Restart-Service([string]$url) {
+    $svcPid = Get-ServicePid
+    if ($DryRun) { Write-Log "DRY-RUN would restart the service with $($serviceCfg['urlEnvVar'])=$url"; return }
+    if ($svcPid) { Stop-Process -Id $svcPid -Force }
+    Start-Sleep -Seconds 4
+    Start-ServiceProcess $url
 }
 function Get-HttpStatus([string]$uri) {
     # 0 means "no HTTP response at all" (connection refused / DNS / TLS failure).
@@ -255,6 +283,59 @@ function TooSoonToRestart {
     return (((Get-Date) - $when).TotalMinutes -lt [int]$cfg['minMinutesBetweenRestarts'])
 }
 
+# ------------------------------------------------------------------ alerting
+# The alert goes out from THIS script, not through the watched service: a dead
+# service cannot report its own death. Credentials are read from a separate file so
+# the config stays shareable, and they are never written to the log.
+function Get-NotifyCredentials {
+    $token = [string]$notifyCfg['botToken']
+    $chat  = [string]$notifyCfg['chatId']
+    $sf = [string]$notifyCfg['secretsFile']
+    if ($sf -and (Test-Path -LiteralPath $sf)) {
+        try {
+            $sec = Get-Content -LiteralPath $sf -Raw | ConvertFrom-Json
+            if ($sec.botToken) { $token = [string]$sec.botToken }
+            if ($sec.chatId)   { $chat  = [string]$sec.chatId }
+        } catch {
+            Write-Log "could not read notify.secretsFile - alerting degraded: $($_.Exception.Message)"
+        }
+    }
+    return [ordered]@{ token = $token; chat = $chat }
+}
+function TooSoonToAlert {
+    if (-not (Test-Path -LiteralPath $logPath)) { return $false }
+    $stamp = Select-String -LiteralPath $logPath -Pattern '\(alert sent\)' -ErrorAction SilentlyContinue
+    if (-not $stamp) { return $false }
+    $last = $stamp[-1].Line -replace '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*', '$1'
+    try { $when = [datetime]::ParseExact($last, 'yyyy-MM-dd HH:mm:ss', $null) } catch { return $false }
+    return (((Get-Date) - $when).TotalMinutes -lt [int]$notifyCfg['remindMinutes'])
+}
+function Send-Alert([string]$text) {
+    if (-not $notifyCfg['enabled']) { return }
+    if (TooSoonToAlert) {
+        Write-Log "alert suppressed (another one went out less than $($notifyCfg['remindMinutes']) min ago)"
+        return
+    }
+    $c = Get-NotifyCredentials
+    if (-not $c.token -or -not $c.chat) {
+        Write-Log 'alert NOT sent - no bot token / chat id configured'
+        return
+    }
+    if ($DryRun) { Write-Log "DRY-RUN would send alert: $text"; return }
+    $base = [string]$notifyCfg['apiBase']
+    if (-not $base) { $base = 'https://api.telegram.org' }
+    $uri = $base.TrimEnd('/') + '/bot' + $c.token + '/sendMessage'
+    try {
+        $r = Invoke-RestMethod -Uri $uri -Method Post -TimeoutSec ([int]$cfg['healthTimeoutSeconds']) `
+             -Body @{ chat_id = $c.chat; text = $text; disable_web_page_preview = $true }
+        $mid = $null
+        if ($r -and $r.result) { $mid = $r.result.message_id }
+        Write-Log "alert sent (alert sent) message_id $mid"
+    } catch {
+        Write-Log "alert FAILED - nothing delivered: $($_.Exception.Message)"
+    }
+}
+
 # ------------------------------------------------------------------ the scan
 if (-not $serviceCfg['launcher']) {
     Write-Log 'no service.launcher configured - nothing to watch'
@@ -262,7 +343,33 @@ if (-not $serviceCfg['launcher']) {
 }
 
 $svc = Get-ServicePid
-if (-not $svc) { Write-Log 'service is not running - nothing to watch (no autostart by design)'; exit 0 }
+if (-not $svc) {
+    if (-not $cfg['autoStart']) {
+        Write-Log 'service is not running - autoStart is off, nothing to watch'
+        Send-Alert ("[watchdog] the service on port " + $serviceCfg['port'] + " is DOWN and autoStart is off - nothing will start it")
+        exit 0
+    }
+    if (TooSoonToRestart) {
+        Write-Log 'service is down but a restart happened recently - waiting'
+        Send-Alert ("[watchdog] the service on port " + $serviceCfg['port'] + " is still DOWN - waiting before trying again")
+        exit 0
+    }
+    Write-Log 'service is not running - starting it (restarting)'
+    $url = Get-TunnelUrl
+    if (-not (Get-TunnelProcess)) {
+        $url = Start-Tunnel
+        if (-not $url) {
+            Write-Log 'could not obtain a tunnel URL - giving up this round'
+            Send-Alert "[watchdog] the service was DOWN and the tunnel could not be started - manual attention needed"
+            exit 1
+        }
+        if ($cfg['urlFile'] -and -not $DryRun) { Set-Content -LiteralPath $cfg['urlFile'] -Value $url -Encoding ASCII }
+    }
+    Restart-Service $url
+    Write-Log "repaired: service started again, tunnel $url"
+    Send-Alert ("[watchdog] the service was DOWN - started it again. Public URL: " + $url)
+    exit 0
+}
 
 $tunnel = Get-TunnelProcess
 $url = Get-TunnelUrl
@@ -275,6 +382,7 @@ if (-not $tunnel) {
     if ($cfg['urlFile'] -and -not $DryRun) { Set-Content -LiteralPath $cfg['urlFile'] -Value $newUrl -Encoding ASCII }
     Restart-Service $newUrl
     Write-Log "repaired: tunnel $newUrl, service restarted"
+    Send-Alert ("[watchdog] the tunnel had died - new public URL: " + $newUrl)
     exit 0
 }
 
@@ -293,6 +401,7 @@ if (-not (Test-TunnelHealthy $url)) {
     if ($cfg['urlFile'] -and -not $DryRun) { Set-Content -LiteralPath $cfg['urlFile'] -Value $newUrl -Encoding ASCII }
     Restart-Service $newUrl
     Write-Log "repaired: tunnel $newUrl, service restarted"
+    Send-Alert ("[watchdog] the public URL stopped answering - repaired, new public URL: " + $newUrl)
     exit 0
 }
 

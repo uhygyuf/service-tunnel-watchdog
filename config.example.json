@@ -19,10 +19,25 @@
   "_bootWaitSeconds": "How long to wait for the service to listen after a restart.",
   "bootWaitSeconds": 90,
 
+  "_autoStart": "false (default) = a dead service is reported but never started. true = crash recovery: the watchdog starts the service again (and the tunnel, if that died too). This is NOT a Windows-boot autostart - the watchdog only acts when its scheduled task runs.",
+  "autoStart": false,
+
+  "_notify": "Out-of-band alerting, sent by this script straight to the Telegram Bot API - never through the service it watches, because a dead service cannot report its own death. Keep the token in a separate secrets file, not in this config.",
+  "notify": {
+    "enabled": false,
+    "apiBase": "https://api.telegram.org",
+    "botToken": "",
+    "chatId": "",
+    "secretsFile": "watchdog-secrets.json",
+    "remindMinutes": 60
+  },
+
+  "_secretsFileFormat": "watchdog-secrets.json looks like: {\"botToken\": \"123456:ABC...\", \"chatId\": \"123456789\"} - keep it out of version control.",
+
   "_service": "The thing being kept alive.",
   "service": {
     "port": 5678,
-    "launcher": "C:\path\to\start-service.bat",
+    "launcher": "C:\\path\\to\\start-service.bat",
     "args": [],
     "urlEnvVar": "SERVICE_PUBLIC_URL",
     "healthPath": "/"
@@ -33,7 +48,7 @@
     "exe": "cloudflared.exe",
     "args": ["tunnel", "--url", "http://localhost:{port}", "--protocol", "http2", "--no-autoupdate", "--logfile", "{logfile}"],
     "processName": "cloudflared",
-    "urlPattern": "https://[a-z0-9-]+\.trycloudflare\.com",
+    "urlPattern": "https://[a-z0-9-]+\\.trycloudflare\\.com",
     "logFile": "tunnel.log"
   }
 }

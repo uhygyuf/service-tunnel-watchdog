@@ -25,7 +25,39 @@ This watchdog closes that gap on a schedule: one scan, one decision, one log lin
   PASS  no URL yet -> wait instead of restarting               a connecting tunnel is not a broken tunnel
   PASS  edge 5xx + healthy service -> tunnel is broken, repaired stale URL behind a connected-looking tunnel is detected
   PASS  control-char path is caught and falls back             loud warning instead of silent write failures
-RESULT: ALL PASS (14/14 passed)
+  PASS  autoStart off: a dead service stays dead               crash recovery stays opt-in
+  PASS  autoStart on: a dead service is started again          launcher runs: 1
+  PASS  the restarted service gets the public URL              SERVICE_PUBLIC_URL = https://t13-tunnel.test
+  PASS  repair sends an out-of-band alert                      posted straight to the bot API, not through the watched service
+  PASS  the bot token never reaches the log                    token read from the secrets file only
+  PASS  repeated alerts are rate limited                       alerts delivered: 1
+  PASS  notify without credentials degrades loudly             logged instead of throwing
+RESULT: ALL PASS (21/21 passed)
+```
+
+## Crash recovery and alerting (opt-in)
+
+Two switches, both off by default, both about the case where **nothing local can report the failure**:
+
+```json
+{
+  "autoStart": true,
+  "notify": { "enabled": true, "secretsFile": "watchdog-secrets.json" }
+}
+```
+
+* **`autoStart`** — a dead service is started again on the next scan (with the tunnel restarted first
+  if that died too, so the service comes back with the right public URL). This is crash recovery,
+  not a Windows-boot autostart: the watchdog only ever acts when its scheduled task runs.
+* **`notify`** — alerts go from the script itself to the Telegram Bot API, **never through the watched
+  service**, because a service that is down cannot report its own death. Alerts fire on every repair
+  and while a service stays down; repeats are rate-limited by `remindMinutes`.
+
+The bot token lives in `watchdog-secrets.json`, not in the shareable config, and it is never written
+to the log — both of which are asserted by tests:
+
+```json
+{ "botToken": "123456:ABC-DEF...", "chatId": "123456789" }
 ```
 
 ---
