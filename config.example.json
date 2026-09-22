@@ -34,6 +34,15 @@
 
   "_secretsFileFormat": "watchdog-secrets.json looks like: {\"botToken\": \"123456:ABC...\", \"chatId\": \"123456789\"} - keep it out of version control.",
 
+  "_hook": "Optional command run after a repair, and again on any scan where the current public URL differs from the last one the hook succeeded with - use it to re-register a URL that changed (a hosted page pointing at a file, a webhook provider, an OAuth callback). {url} in args is replaced with the current public URL. The state file records a URL only after a hook run that exited 0, so a failure or a timeout is retried on the next scan.",
+  "hook": {
+    "enabled": false,
+    "command": "powershell.exe",
+    "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\path\\to\\repoint-the-url.ps1"],
+    "stateFile": "hook-state.txt",
+    "timeoutSeconds": 120
+  },
+
   "_service": "The thing being kept alive.",
   "service": {
     "port": 5678,

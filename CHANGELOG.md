@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0
+- Opt-in `hook`: one command of yours, run with the current public URL whenever that URL changes
+  (after a repair, or on any scan where it differs from the last one the hook succeeded with). The
+  state file records a URL only after a hook run that exited 0, so a failure or a hang is retried on
+  the next scan; the command is killed at `hook.timeoutSeconds`.
+- 9 new assertions for the hook (runs once per URL, sees the current URL, skips an unchanged URL,
+  re-runs on a changed URL, logs a non-zero exit, retries after a failure, does nothing under
+  `-DryRun`, does nothing when disabled).
+
 ## 1.0.0
 First release.
 

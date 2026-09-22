@@ -357,6 +357,94 @@ Record 'notify without credentials degrades loudly' ((Read-Log $r16) -match 'no 
        'logged instead of throwing'
 Stop-Sandbox $r16
 
+# --- hook: re-register the URL after it changes (T17-T22) -------------------
+# The hook is the answer to "the tunnel restarted, so every consumer of the old URL
+# is now talking to nothing". A local .bat stands in for the real publisher.
+function Set-Hook([string]$root, [bool]$enabled, [int]$exitCode) {
+    $bat = Join-Path $root 'fake-hook.bat'
+    ("@echo off`r`n" + "echo %1>> `"%~dp0hook-runs.txt`"`r`n" + "exit /b $exitCode`r`n") |
+        Set-Content -LiteralPath $bat -Encoding ASCII
+    $cfg = Get-Content -LiteralPath (Join-Path $root 'watchdog-config.json') -Raw | ConvertFrom-Json
+    $cfg | Add-Member -NotePropertyName hook -NotePropertyValue ([pscustomobject]@{
+        enabled        = $enabled
+        command        = $bat
+        args           = @('{url}')
+        stateFile      = (Join-Path $root 'hook-state.txt')
+        timeoutSeconds = 30
+    }) -Force
+    $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'watchdog-config.json') -Encoding UTF8
+}
+function HookRuns([string]$root) {
+    $p = Join-Path $root 'hook-runs.txt'
+    if (-not (Test-Path -LiteralPath $p)) { return @() }
+    return @(Get-Content -LiteralPath $p)
+}
+function New-HealthySandbox([string]$name, [int]$svcPort, [int]$webPort) {
+    # same shape as T6: the announced "public" URL is a local responder that answers, so
+    # the scan reaches the healthy branch without touching the network
+    $root = New-Sandbox $name $svcPort
+    Start-FakeService $root $svcPort | Out-Null
+    Start-Process -FilePath 'powershell' -WindowStyle Hidden -ArgumentList `
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $root 'respond.ps1'), '-Port', $webPort, '-Status', '200' | Out-Null
+    for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Milliseconds 500; if (Get-NetTCPConnection -LocalPort $webPort -State Listen -ErrorAction SilentlyContinue) { break } }
+    $cfg = Get-Content -LiteralPath (Join-Path $root 'watchdog-config.json') -Raw | ConvertFrom-Json
+    $cfg.tunnel.urlPattern = 'http://127\.0\.0\.1:[0-9]+'
+    $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'watchdog-config.json') -Encoding UTF8
+    "INF url=http://127.0.0.1:$webPort" | Set-Content -LiteralPath (Join-Path $root 'tunnel.log') -Encoding ASCII
+    Start-Process -FilePath 'ping' -ArgumentList '-n', '400', '127.0.0.1' -WindowStyle Hidden | Out-Null
+    Start-Sleep -Seconds 2
+    return $root
+}
+function HookState([string]$root) {
+    $p = Join-Path $root 'hook-state.txt'
+    if (-not (Test-Path -LiteralPath $p)) { return '' }
+    return (Get-Content -LiteralPath $p -Raw).Trim()
+}
+
+$r17 = New-HealthySandbox 't17' 45817 45871
+Set-Hook $r17 $true 0
+Invoke-Watchdog $r17
+$runs17 = @(HookRuns $r17)
+Record 'hook runs when the URL is not published yet' ($runs17.Count -eq 1) "runs: $($runs17.Count)"
+Record 'the hook receives the current URL' (($runs17.Count -eq 1) -and ($runs17[0].Trim() -eq 'http://127.0.0.1:45871')) `
+       "hook saw: $(if ($runs17.Count) { $runs17[0].Trim() } else { 'nothing' })"
+Record 'a successful hook records the URL it published' ((HookState $r17) -eq 'http://127.0.0.1:45871') "state = $(HookState $r17)"
+
+Invoke-Watchdog $r17
+Record 'same URL -> the hook does not run again' (@(HookRuns $r17).Count -eq 1) "runs: $(@(HookRuns $r17).Count)"
+
+Start-Process -FilePath 'powershell' -WindowStyle Hidden -ArgumentList `
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $r17 'respond.ps1'), '-Port', '45872', '-Status', '200' | Out-Null
+for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Milliseconds 500; if (Get-NetTCPConnection -LocalPort 45872 -State Listen -ErrorAction SilentlyContinue) { break } }
+"INF url=http://127.0.0.1:45872" | Add-Content -LiteralPath (Join-Path $r17 'tunnel.log')
+Invoke-Watchdog $r17
+$runs17b = @(HookRuns $r17)
+Record 'a changed URL makes the hook run again' (($runs17b.Count -eq 2) -and ($runs17b[-1].Trim() -eq 'http://127.0.0.1:45872')) `
+       "hook saw: $(if ($runs17b.Count) { $runs17b[-1].Trim() } else { 'nothing' })"
+Stop-Sandbox $r17
+
+$r20 = New-HealthySandbox 't20' 45820 45873
+Set-Hook $r20 $true 1
+Invoke-Watchdog $r20
+Record 'a hook that exits non-zero is logged' ((Read-Log $r20) -match 'hook exited 1') 'failure is visible in the log'
+Record 'a failed hook is not recorded as done' ((@(HookRuns $r20).Count -eq 1) -and ((HookState $r20) -eq '')) 'state stays empty'
+Invoke-Watchdog $r20
+Record 'a failed hook is retried on the next scan' (@(HookRuns $r20).Count -eq 2) "runs: $(@(HookRuns $r20).Count)"
+Stop-Sandbox $r20
+
+$r21 = New-HealthySandbox 't21' 45821 45874
+Set-Hook $r21 $true 0
+Invoke-Watchdog $r21 -DryRun
+Record '-DryRun reports the hook but does not run it' (((Read-Log $r21) -match 'DRY-RUN would run hook') -and (@(HookRuns $r21).Count -eq 0)) `
+       'nothing published in a dry run'
+Stop-Sandbox $r21
+
+$r22 = New-HealthySandbox 't22' 45822 45875
+Set-Hook $r22 $false 0
+Invoke-Watchdog $r22
+Record 'hook disabled -> nothing runs' (@(HookRuns $r22).Count -eq 0) 'opt-in stays opt-in'
+Stop-Sandbox $r22
+
 # --- cleanup ---------------------------------------------------------------
 Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue

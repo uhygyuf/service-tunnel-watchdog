@@ -62,6 +62,35 @@ to the log — both of which are asserted by tests:
 
 ---
 
+## Republishing a URL that changed (opt-in `hook`)
+
+A repaired tunnel usually comes back on a **new** hostname, and whatever was told the old one keeps
+using the dead address: a hosted page with the URL baked into a JSON file, a webhook subscription, an
+OAuth callback. The watchdog cannot know how you re-register those, so it runs one command of yours:
+
+```json
+{
+  "hook": {
+    "enabled": true,
+    "command": "powershell.exe",
+    "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\demo\\publish-url.ps1"],
+    "stateFile": "hook-state.txt",
+    "timeoutSeconds": 120
+  }
+}
+```
+
+* `{url}` in `args` is replaced with the current public URL (`{port}` and `{logfile}` work as well).
+* The hook runs **after a repair**, and on any scan where the URL differs from the one the last
+  successful run was given — so a tunnel you restarted by hand is republished on the next scan, at
+  most five minutes later.
+* `stateFile` records a URL **only after a run that exited 0**. A hook that fails or hangs (it is
+  killed at `timeoutSeconds`) is retried on the next scan and the failure is logged.
+* Design the hook to be idempotent and fast: it may run on every URL change, and the watchdog waits
+  for it before it exits.
+
+---
+
 ## What it does
 
 | Situation | Action |
@@ -72,6 +101,7 @@ to the log — both of which are asserted by tests:
 | The public URL does not answer at all | restart tunnel + service |
 | The public URL answers 5xx while the local service answers fine | restart tunnel + service (a stale hostname behind a connected-looking tunnel looks exactly like this) |
 | Everything healthy | log one line and exit |
+| `hook.enabled` and the URL differs from the last published one | run the hook with `{url}` filled in (after the repair, or on this scan) |
 | A repair happened less than `minMinutesBetweenRestarts` ago | log and wait (anti-flapping) |
 | The off-switch file exists | exit immediately |
 
@@ -122,6 +152,8 @@ window per interval, forever.
 | `minMinutesBetweenRestarts` | `8` | Anti-flapping cooldown |
 | `urlWaitSeconds` / `bootWaitSeconds` | `60` / `90` | How long to wait for the URL / for the service to listen |
 | `healthTimeoutSeconds` | `20` | Timeout for the local and public health probes |
+| `hook.enabled` / `hook.command` / `hook.args` | off / — | Optional command run when the public URL changes; `{url}`, `{port}`, `{logfile}` are substituted |
+| `hook.stateFile` / `hook.timeoutSeconds` | `hook-state.txt` / `120` | File recording the last successfully published URL, and how long the hook may run |
 | `logFile` / `urlFile` / `offSwitch` | next to the script | Decision log, current-URL file, kill switch |
 
 **Watch the escaping in your JSON.** `"D:\Tools\n8n\x.log"` is a path; `"D:\Tools\n8n..."` with one

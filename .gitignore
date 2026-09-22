@@ -3,4 +3,5 @@ watchdog-config.json
 public-url.txt
 tunnel.log
 watchdog-off.txt
+hook-state.txt
 tests-last-run.txt

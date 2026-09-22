@@ -20,6 +20,13 @@
         public URL does not answer     -> restart tunnel + service
       * everything healthy             -> log one line and exit
 
+    A tunnel restart usually means a NEW public URL, and anything that was told the old
+    one (a webhook provider, a hosted page with the address baked into a file, an OAuth
+    callback) keeps using the dead address. So the watchdog can also run a `hook`: one
+    command of yours, given the current URL, run after a repair and again on any scan
+    where the URL differs from the last one the hook succeeded with. Failed or timed-out
+    hook runs are retried on the next scan.
+
     It is deliberately boring: no daemon, no registry, no background loop - one scan
     per scheduled-task run, every decision written to a log, a file-based off switch,
     and an anti-flapping guard so a broken network cannot cause restart storms.
@@ -99,6 +106,13 @@ $defaults = [ordered]@{
         secretsFile   = (Join-Path $scriptDir 'watchdog-secrets.json')
         remindMinutes = 60
     }
+    hook                      = [ordered]@{
+        enabled        = $false
+        command        = ''
+        args           = @()
+        stateFile      = 'hook-state.txt'
+        timeoutSeconds = 120
+    }
 }
 
 # ------------------------------------------------------------------ config load
@@ -172,6 +186,12 @@ $notifyCfg['secretsFile'] = Repair-Path $notifyCfg['secretsFile'] (Join-Path $sc
 if (-not [System.IO.Path]::IsPathRooted([string]$notifyCfg['secretsFile'])) {
     $notifyCfg['secretsFile'] = Join-Path $scriptDir ([string]$notifyCfg['secretsFile'])
 }
+$hookCfg = $cfg['hook']
+$hookCfg['stateFile'] = Repair-Path $hookCfg['stateFile'] (Join-Path $scriptDir 'hook-state.txt') 'hook.stateFile'
+if (-not [System.IO.Path]::IsPathRooted([string]$hookCfg['stateFile'])) {
+    $hookCfg['stateFile'] = Join-Path $scriptDir ([string]$hookCfg['stateFile'])
+}
+$hookStatePath = [string]$hookCfg['stateFile']
 
 function Write-Log([string]$m) {
     if ($VerbosePreference -ne 'SilentlyContinue') { Write-Verbose $m }
@@ -248,6 +268,42 @@ function Restart-Service([string]$url) {
     if ($svcPid) { Stop-Process -Id $svcPid -Force }
     Start-Sleep -Seconds 4
     Start-ServiceProcess $url
+}
+function Test-HookNeeded([string]$url) {
+    # The hook exists to re-register a URL that changed, so run it when the URL differs
+    # from the one the last successful run was given. State is only written after a run
+    # that exited 0, which is what makes a failure retry on the next scan.
+    if (-not $hookCfg['enabled'] -or -not $hookCfg['command'] -or -not $url) { return $false }
+    if (Test-Path -LiteralPath $hookStatePath) {
+        $last = (Get-Content -LiteralPath $hookStatePath -Raw).Trim()
+        if ($last -eq $url) { return $false }
+    }
+    return $true
+}
+function Invoke-Hook([string]$url) {
+    $hargs = @(Expand-Args $hookCfg['args'] $url)
+    if ($DryRun) { Write-Log "DRY-RUN would run hook: $($hookCfg['command']) $($hargs -join ' ')"; return }
+    try {
+        if ($hargs.Count -gt 0) {
+            $p = Start-Process -FilePath $hookCfg['command'] -ArgumentList $hargs -NoNewWindow -PassThru
+        } else {
+            $p = Start-Process -FilePath $hookCfg['command'] -NoNewWindow -PassThru
+        }
+        $p | Wait-Process -Timeout ([int]$hookCfg['timeoutSeconds']) -ErrorAction SilentlyContinue
+        if (-not $p.HasExited) {
+            Stop-Process -Id $p.Id -Force
+            Write-Log "hook did not finish within $($hookCfg['timeoutSeconds'])s - killed, will retry next scan"
+            return
+        }
+        if ($p.ExitCode -eq 0) {
+            Write-Log "hook finished OK for $url"
+            Set-Content -LiteralPath $hookStatePath -Value $url -Encoding ASCII
+        } else {
+            Write-Log "hook exited $($p.ExitCode) for $url - will retry next scan"
+        }
+    } catch {
+        Write-Log "hook could not run: $($_.Exception.Message)"
+    }
 }
 function Get-HttpStatus([string]$uri) {
     # 0 means "no HTTP response at all" (connection refused / DNS / TLS failure).
@@ -368,6 +424,7 @@ if (-not $svc) {
     Restart-Service $url
     Write-Log "repaired: service started again, tunnel $url"
     Send-Alert ("[watchdog] the service was DOWN - started it again. Public URL: " + $url)
+    if (Test-HookNeeded $url) { Invoke-Hook $url }
     exit 0
 }
 
@@ -383,6 +440,7 @@ if (-not $tunnel) {
     Restart-Service $newUrl
     Write-Log "repaired: tunnel $newUrl, service restarted"
     Send-Alert ("[watchdog] the tunnel had died - new public URL: " + $newUrl)
+    if (Test-HookNeeded $newUrl) { Invoke-Hook $newUrl }
     exit 0
 }
 
@@ -402,8 +460,10 @@ if (-not (Test-TunnelHealthy $url)) {
     Restart-Service $newUrl
     Write-Log "repaired: tunnel $newUrl, service restarted"
     Send-Alert ("[watchdog] the public URL stopped answering - repaired, new public URL: " + $newUrl)
+    if (Test-HookNeeded $newUrl) { Invoke-Hook $newUrl }
     exit 0
 }
 
 Write-Log "healthy: service pid $svc, tunnel $url"
+if (Test-HookNeeded $url) { Invoke-Hook $url }
 exit 0
