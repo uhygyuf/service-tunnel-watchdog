@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.2
+- A round that repaired nothing no longer spends the cooldown. The `(restarting)` stamp is written
+  only when a repair actually completed: a replacement tunnel that the edge does not answer for, or
+  a service started onto an address that does not answer yet, is logged but not stamped. The stamp
+  means "a repair happened", and the cooldown exists to stop restart storms after a repair, not to
+  lock the watchdog out of a repair that never happened. Observed as a real stall: the tunnel was
+  dead, two replacement addresses were refused, and every following scan sat out the cooldown while
+  the public page pointed at nothing.
+- Each replacement site tries twice inside one scan instead of once, so a single bad round does not
+  cost a whole scan interval.
+- 6 new assertions (T26: a replacement that does not answer is tried once more in the same scan, the
+  unreachable address is not recorded, the service is not restarted onto it, and no `(restarting)`
+  stamp is written; T27: the next scan picks the work up instead of waiting out a cooldown). T3 now
+  models a replacement address that answers, T5 and T10 follow the new log wording.
+
 ## 1.1.1
 - Publishing waits for the service to answer through the tunnel before running the hook, and retries
   the hook inside the same scan (`hook.attempts`, default 3, `hook.retrySeconds`, default 20). A

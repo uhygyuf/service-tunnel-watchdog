@@ -480,8 +480,9 @@ if (-not $svc) {
         Send-Alert ("[watchdog] the service on port " + $serviceCfg['port'] + " is still DOWN - waiting before trying again")
         exit 0
     }
-    Write-Log 'service is not running - starting it (restarting)'
+    Write-Log 'service is not running - starting it'
     $url = Get-TunnelUrl
+    $tunnelOk = $true
     if (-not (Get-TunnelProcess)) {
         $url = Start-Tunnel
         if (-not $url) {
@@ -489,13 +490,21 @@ if (-not $svc) {
             Send-Alert "[watchdog] the service was DOWN and the tunnel could not be started - manual attention needed"
             exit 1
         }
-        if (-not (Wait-TunnelAnswer $url ([int]$cfg['tunnelAnswerWaitSeconds']))) {
+        $tunnelOk = Wait-TunnelAnswer $url ([int]$cfg['tunnelAnswerWaitSeconds'])
+        if (-not $tunnelOk) {
             Write-Log "new tunnel announced $url but the edge does not answer for it yet - starting the service anyway"
         }
         if ($cfg['urlFile'] -and -not $DryRun) { Set-Content -LiteralPath $cfg['urlFile'] -Value $url -Encoding ASCII }
     }
     Restart-Service $url
-    Write-Log "repaired: service started again, tunnel $url"
+    if ($tunnelOk) {
+        Write-Log "repaired: service started again, tunnel $url (restarting)"
+    } else {
+        # The service is back but the address is not usable yet. Leaving this unstamped keeps the
+        # next scan free to replace the tunnel instead of waiting out the cooldown on a demo that
+        # nobody can reach.
+        Write-Log "service started again on $url but that address does not answer yet - the next scan keeps looking"
+    }
     Send-Alert ("[watchdog] the service was DOWN - started it again. Public URL: " + $url)
     Publish-IfNeeded $url
     exit 0
@@ -506,15 +515,33 @@ $url = Get-TunnelUrl
 
 if (-not $tunnel) {
     if (TooSoonToRestart) { Write-Log 'tunnel missing but a restart happened recently - waiting'; exit 0 }
-    Write-Log 'tunnel process is gone - restarting tunnel + service (restarting)'
-    $newUrl = Start-Tunnel
-    if (-not $newUrl) { Write-Log 'could not obtain a tunnel URL - giving up this round'; exit 1 }
-    if (-not (Wait-TunnelAnswer $newUrl ([int]$cfg['tunnelAnswerWaitSeconds']))) {
-        Write-Log "new tunnel announced $newUrl but the edge does not answer for it yet - starting the service anyway"
+    Write-Log 'tunnel process is gone - bringing a new one up'
+    $answerWait = [int]$cfg['tunnelAnswerWaitSeconds']
+    $newUrl = $null
+    $lastSeen = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        if (-not $DryRun) { Stop-TunnelProcesses }
+        $candidate = Start-Tunnel
+        if (-not $candidate) { Write-Log "attempt $attempt produced no address at all"; continue }
+        $lastSeen = $candidate
+        if (Wait-TunnelAnswer $candidate $answerWait) { $newUrl = $candidate; break }
+        Write-Log "attempt $attempt announced $candidate but the edge does not answer for it yet"
+    }
+    if (-not $newUrl) {
+        if (-not $lastSeen) { Write-Log 'could not obtain a tunnel URL - giving up this round'; exit 1 }
+        # The service must not be left down, so it comes up on the last address seen even though
+        # that address is not answering yet. No '(restarting)' stamp here on purpose: this repair
+        # did not succeed, so the next scan is free to pick the work up again straight away
+        # instead of sitting out the cooldown.
+        Write-Log "no address answered after 2 attempts - starting the service on $lastSeen, the next scan keeps looking"
+        if ($cfg['urlFile'] -and -not $DryRun) { Set-Content -LiteralPath $cfg['urlFile'] -Value $lastSeen -Encoding ASCII }
+        Restart-Service $lastSeen
+        Send-Alert ("[watchdog] the tunnel was down and its replacement " + $lastSeen + " does not answer yet - the service is up, still working on the address")
+        exit 0
     }
     if ($cfg['urlFile'] -and -not $DryRun) { Set-Content -LiteralPath $cfg['urlFile'] -Value $newUrl -Encoding ASCII }
     Restart-Service $newUrl
-    Write-Log "repaired: tunnel $newUrl, service restarted"
+    Write-Log "repaired: tunnel $newUrl, service restarted (restarting)"
     Send-Alert ("[watchdog] the tunnel had died - new public URL: " + $newUrl)
     Publish-IfNeeded $newUrl
     exit 0
@@ -528,21 +555,30 @@ if (-not $url) {
 
 if (-not (Test-TunnelHealthy $url)) {
     if (TooSoonToRestart) { Write-Log 'tunnel unreachable but a restart happened recently - waiting'; exit 0 }
-    Write-Log "tunnel process runs but $url does not answer - restarting tunnel + service (restarting)"
-    if (-not $DryRun) { Stop-TunnelProcesses }
-    $newUrl = Start-Tunnel
-    if (-not $newUrl) { Write-Log 'could not obtain a tunnel URL - giving up this round'; exit 1 }
-    if (-not (Wait-TunnelAnswer $newUrl ([int]$cfg['tunnelAnswerWaitSeconds']))) {
+    Write-Log "tunnel process runs but $url does not answer - replacing it"
+    $answerWait = [int]$cfg['tunnelAnswerWaitSeconds']
+    $newUrl = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        if (-not $DryRun) { Stop-TunnelProcesses }
+        $candidate = Start-Tunnel
+        if (-not $candidate) { Write-Log "attempt $attempt produced no address at all"; continue }
+        if (Wait-TunnelAnswer $candidate $answerWait) { $newUrl = $candidate; break }
         # An address the edge does not answer for is not an address. Recording it would hand a
-        # hostname that does not exist to the service and to the publish step, and the published
-        # page would point at nothing until the next scan.
-        Write-Log "the replacement tunnel announced $newUrl but the edge does not answer for it - not recording it, leaving the service alone"
-        Send-Alert ("[watchdog] the tunnel was replaced but " + $newUrl + " does not answer - nothing was republished, looking again next scan")
+        # hostname that does not exist to the service and to the publish step.
+        Write-Log "attempt $attempt announced $candidate but the edge does not answer for it"
+    }
+    if (-not $newUrl) {
+        # Nothing was recorded and the service was left alone, so this scan changed nothing.
+        # Deliberately no '(restarting)' stamp: the cooldown exists to stop restart storms after a
+        # repair, not to lock the watchdog out of a repair that never happened - otherwise one bad
+        # round leaves the demo dark until the cooldown runs out.
+        Write-Log 'no replacement answered after 2 attempts - nothing recorded, the next scan tries again'
+        Send-Alert '[watchdog] the tunnel address stopped working and two replacements did not answer - nothing was republished, trying again next scan'
         exit 0
     }
     if ($cfg['urlFile'] -and -not $DryRun) { Set-Content -LiteralPath $cfg['urlFile'] -Value $newUrl -Encoding ASCII }
     Restart-Service $newUrl
-    Write-Log "repaired: tunnel $newUrl, service restarted"
+    Write-Log "repaired: tunnel $newUrl, service restarted (restarting)"
     Send-Alert ("[watchdog] the public URL stopped answering - repaired, new public URL: " + $newUrl)
     Publish-IfNeeded $newUrl
     exit 0

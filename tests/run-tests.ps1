@@ -141,19 +141,29 @@ Record 'service down -> no autostart' (((Read-Log $r2) -match 'not running') -an
        'nothing was started'
 Stop-Sandbox $r2
 
-# --- T3: tunnel gone -> tunnel + service restarted with the new URL --------
+# --- T3: tunnel gone -> a replacement that answers is recorded and used ----
+# A repair only counts as one when the replacement address actually answers, so this sandbox
+# announces an address that does respond (the loopback responder below), as a real tunnel does.
 $r3 = New-Sandbox 't3' 45803
 $cfg3 = Get-Content -LiteralPath (Join-Path $r3 'watchdog-config.json') -Raw | ConvertFrom-Json
-# the fake tunnel announces an address nothing answers for, so keep the edge check short
 $cfg3 | Add-Member -NotePropertyName tunnelAnswerWaitSeconds -NotePropertyValue 6 -Force
+$cfg3.tunnel.urlPattern = 'http://127\.0\.0\.1:[0-9]+'
 $cfg3 | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $r3 'watchdog-config.json') -Encoding UTF8
 Start-FakeService $r3 45803 | Out-Null
+Start-Process -FilePath 'powershell' -WindowStyle Hidden -ArgumentList `
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $r3 'respond.ps1'), '-Port', '45870', '-Status', '200' | Out-Null
+for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Milliseconds 500; if (Get-NetTCPConnection -LocalPort 45870 -State Listen -ErrorAction SilentlyContinue) { break } }
+("@echo off`r`n" + "echo INF url=http://127.0.0.1:45870>> `"%~dp0tunnel.log`"`r`n" +
+ "start `"`" /b ping -n 400 127.0.0.1 > nul`r`n") |
+    Set-Content -LiteralPath (Join-Path $r3 'fake-tunnel.bat') -Encoding ASCII
+Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue   # no tunnel process to begin with
+Start-Sleep -Seconds 1
 Invoke-Watchdog $r3
 $log3 = Read-Log $r3
 $runs3 = @(LauncherRuns $r3)
 Record 'tunnel gone -> repaired' ($log3 -match 'repaired: tunnel') 'log says repaired'
-Record 'new tunnel URL recorded' ((UrlFile $r3) -eq 'https://t3-tunnel.test') "public-url.txt = $(UrlFile $r3)"
-Record 'service restarted with the new public URL' (($runs3.Count -ge 1) -and ($runs3[-1].Trim() -eq 'https://t3-tunnel.test')) `
+Record 'new tunnel URL recorded' ((UrlFile $r3) -eq 'http://127.0.0.1:45870') "public-url.txt = $(UrlFile $r3)"
+Record 'service restarted with the new public URL' (($runs3.Count -ge 1) -and ($runs3[-1].Trim() -eq 'http://127.0.0.1:45870')) `
        "launcher saw SERVICE_PUBLIC_URL = $($runs3[-1])"
 
 # --- T4: flapping guard ----------------------------------------------------
@@ -184,7 +194,7 @@ Start-Process -FilePath 'ping' -ArgumentList '-n', '400', '127.0.0.1' -WindowSty
 Start-Sleep -Seconds 2
 Invoke-Watchdog $r5
 $runs5 = @(LauncherRuns $r5)
-Record 'unreachable tunnel -> repaired' ((Read-Log $r5) -match 'does not answer - restarting') 'connection-level failure detected'
+Record 'unreachable tunnel -> repaired' ((Read-Log $r5) -match 'does not answer - replacing it') 'connection-level failure detected'
 Record 'the address the edge answers for is recorded' ((UrlFile $r5) -eq 'http://127.0.0.1:45876') "public-url.txt = $(UrlFile $r5)"
 Record 'service restarted with the replacement address' (($runs5.Count -ge 1) -and ($runs5[-1].Trim() -eq 'http://127.0.0.1:45876')) `
        "launcher saw $(if ($runs5.Count) { $runs5[-1].Trim() } else { 'nothing' })"
@@ -251,7 +261,7 @@ $cfg10 | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $r10 'wat
 Start-Process -FilePath 'ping' -ArgumentList '-n', '400', '127.0.0.1' -WindowStyle Hidden | Out-Null
 Start-Sleep -Seconds 2
 Invoke-Watchdog $r10
-Record 'edge 5xx + healthy service -> tunnel is broken, repaired' ((Read-Log $r10) -match 'does not answer - restarting') `
+Record 'edge 5xx + healthy service -> tunnel is broken, repaired' ((Read-Log $r10) -match 'does not answer - replacing it') `
        'stale URL behind a connected-looking tunnel is detected'
 Stop-Sandbox $r10
 
@@ -338,7 +348,7 @@ Set-Notify $r13 45913 $true ''
 Invoke-Watchdog $r13
 $log13 = Read-Log $r13
 $runs13 = @(LauncherRuns $r13)
-Record 'autoStart on: a dead service is started again' (($log13 -match 'repaired: service started again') -and ($runs13.Count -ge 1)) `
+Record 'autoStart on: a dead service is started again' (($log13 -match 'service started again') -and ($runs13.Count -ge 1)) `
        "launcher runs: $($runs13.Count)"
 Record 'the restarted service gets the public URL' (($runs13.Count -ge 1) -and ($runs13[-1].Trim() -eq 'https://t13-tunnel.test')) `
        "SERVICE_PUBLIC_URL = $($runs13[-1])"
@@ -516,6 +526,32 @@ Record 'every publish goes through the helper' ((([regex]::Matches($src, 'Publis
 Record 'the helper waits for the service through the tunnel' ($src -match 'Wait-ServiceThroughTunnel \$url \$wait') 'the wait is inside the helper'
 Record 'a replacement address is verified before it is used' ((([regex]::Matches($src, 'Wait-TunnelAnswer')).Count -ge 4) -and ($src -match 'Stop-TunnelProcesses')) `
        'checked at every replacement site, with the old client stopped first'
+
+# --- T26: a round that fixed nothing is retried at once, and spends no cooldown ----
+# Real incident: the replacement address was refused (correct), but the refusal was stamped like a
+# successful repair, so the next scans sat out the cooldown while the public page pointed at
+# nothing. A failed repair must not buy the watchdog silence.
+$r26 = New-Sandbox 't26' 45826
+Start-FakeService $r26 45826 | Out-Null
+$cfg26 = Get-Content -LiteralPath (Join-Path $r26 'watchdog-config.json') -Raw | ConvertFrom-Json
+$cfg26 | Add-Member -NotePropertyName tunnelAnswerWaitSeconds -NotePropertyValue 4 -Force
+$cfg26 | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $r26 'watchdog-config.json') -Encoding UTF8
+"INF url=https://t26-dead.test" | Set-Content -LiteralPath (Join-Path $r26 'tunnel.log') -Encoding ASCII
+"https://t26-dead.test" | Set-Content -LiteralPath (Join-Path $r26 'public-url.txt') -Encoding ASCII
+Start-Process -FilePath 'ping' -ArgumentList '-n', '400', '127.0.0.1' -WindowStyle Hidden | Out-Null
+Start-Sleep -Seconds 2
+$before26 = @(LauncherRuns $r26).Count
+Invoke-Watchdog $r26
+Record 'a replacement that does not answer is tried once more in the same scan' ((Read-Log $r26) -match 'attempt 2 announced') 'one bad round does not burn a whole interval'
+Record 'the unreachable address is still not recorded' ((UrlFile $r26) -eq 'https://t26-dead.test') "public-url.txt = $(UrlFile $r26)"
+Record 'and the service is still not restarted onto it' (@(LauncherRuns $r26).Count -eq $before26) 'no restart onto a hostname that does not exist'
+Record 'a round that repaired nothing does not spend the cooldown' ((Read-Log $r26) -notmatch '\(restarting\)') 'the next scan is free to try again'
+
+# --- T27: so the next scan picks the work up instead of waiting it out --------
+Invoke-Watchdog $r26
+Record 'the next scan tries again rather than waiting out a cooldown' ((([regex]::Matches((Read-Log $r26), 'tunnel process runs but')).Count -ge 2)) 'two scans, two rounds of work'
+Record 'and no cooldown message claims otherwise' ((Read-Log $r26) -notmatch 'restart happened recently - waiting') 'no false cooldown'
+Stop-Sandbox $r26
 
 # --- cleanup ---------------------------------------------------------------
 Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue

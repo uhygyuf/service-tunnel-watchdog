@@ -14,8 +14,8 @@ This watchdog closes that gap on a schedule: one scan, one decision, one log lin
   PASS  off switch stops the watchdog                          no repair attempted
   PASS  service down -> no autostart                           nothing was started
   PASS  tunnel gone -> repaired                                log says repaired
-  PASS  new tunnel URL recorded                                public-url.txt = https://t3-tunnel.test
-  PASS  service restarted with the new public URL              launcher saw SERVICE_PUBLIC_URL = https://t3-tunnel.test
+  PASS  new tunnel URL recorded                                public-url.txt = http://127.0.0.1:45870
+  PASS  service restarted with the new public URL              launcher saw SERVICE_PUBLIC_URL = http://127.0.0.1:45870
   PASS  flapping guard blocks a second restart                 no restart storm within the cooldown
   PASS  unreachable tunnel -> repaired                         connection-level failure detected
   PASS  repair replaced the stale URL file                     URL file rewritten
@@ -32,7 +32,13 @@ This watchdog closes that gap on a schedule: one scan, one decision, one log lin
   PASS  the bot token never reaches the log                    token read from the secrets file only
   PASS  repeated alerts are rate limited                       alerts delivered: 1
   PASS  notify without credentials degrades loudly             logged instead of throwing
-RESULT: ALL PASS (21/21 passed)
+  PASS  a replacement that does not answer is tried once more in the same scan one bad round does not burn a whole interval
+  PASS  the unreachable address is still not recorded          public-url.txt = https://t26-dead.test
+  PASS  and the service is still not restarted onto it         no restart onto a hostname that does not exist
+  PASS  a round that repaired nothing does not spend the cooldown the next scan is free to try again
+  PASS  the next scan tries again rather than waiting out a cooldown two scans, two rounds of work
+  PASS  and no cooldown message claims otherwise               no false cooldown
+RESULT: ALL PASS (47/47 passed)
 ```
 
 ## Crash recovery and alerting (opt-in)
@@ -109,7 +115,7 @@ OAuth callback. The watchdog cannot know how you re-register those, so it runs o
 | The public URL answers 5xx while the local service answers fine | restart tunnel + service (a stale hostname behind a connected-looking tunnel looks exactly like this) |
 | Everything healthy | log one line and exit |
 | `hook.enabled` and the URL differs from the last published one | run the hook with `{url}` filled in (after the repair, or on this scan) |
-| A repair happened less than `minMinutesBetweenRestarts` ago | log and wait (anti-flapping) |
+| A repair happened less than `minMinutesBetweenRestarts` ago | log and wait (anti-flapping). A round that produced no working address is not counted as a repair, so it starts no cooldown |
 | The off-switch file exists | exit immediately |
 
 Design promises: no daemon, no registry keys, no background loop — one scan per scheduled-task run.
