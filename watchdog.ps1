@@ -187,6 +187,10 @@ if (-not [System.IO.Path]::IsPathRooted([string]$notifyCfg['secretsFile'])) {
     $notifyCfg['secretsFile'] = Join-Path $scriptDir ([string]$notifyCfg['secretsFile'])
 }
 $hookCfg = $cfg['hook']
+if (-not $hookCfg['waitForServiceSeconds']) { $hookCfg['waitForServiceSeconds'] = $cfg['bootWaitSeconds'] }
+if (-not $hookCfg['attempts']) { $hookCfg['attempts'] = 3 }
+if (-not $hookCfg['retrySeconds']) { $hookCfg['retrySeconds'] = 20 }
+if (-not $cfg['tunnelAnswerWaitSeconds']) { $cfg['tunnelAnswerWaitSeconds'] = 90 }
 $hookCfg['stateFile'] = Repair-Path $hookCfg['stateFile'] (Join-Path $scriptDir 'hook-state.txt') 'hook.stateFile'
 if (-not [System.IO.Path]::IsPathRooted([string]$hookCfg['stateFile'])) {
     $hookCfg['stateFile'] = Join-Path $scriptDir ([string]$hookCfg['stateFile'])
@@ -305,6 +309,48 @@ function Invoke-Hook([string]$url) {
         Write-Log "hook could not run: $($_.Exception.Message)"
     }
 }
+function Stop-TunnelProcesses {
+    # A second client started while the first one still holds the connection announces a URL
+    # and then dies, and that phantom address is worse than no address at all. Wait for the
+    # process to really go away before starting its replacement.
+    $name = [string]$tunnelCfg['processName']
+    if (-not $name) { return }
+    Get-Process $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 10; $i++) {
+        if (-not (Get-Process $name -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Seconds 1
+    }
+    Write-Log "the old $name process is still around after 10s - starting the replacement anyway"
+}
+function Publish-IfNeeded([string]$url) {
+    if (-not (Test-HookNeeded $url)) { return }
+    if ($DryRun) { Invoke-Hook $url; return }   # Invoke-Hook reports what it would do
+    $wait = [int]$hookCfg['waitForServiceSeconds']
+    if ($wait -gt 0 -and -not (Wait-ServiceThroughTunnel $url $wait)) {
+        # The hook checks the address from the public side. Running it while the service is
+        # still booting behind the tunnel fails for a reason that has nothing to do with the
+        # address, and the next chance is a whole scan away - so wait here instead.
+        Write-Log "service is not answering through $url yet - running the hook anyway (best effort)"
+    }
+    $attempts = [int]$hookCfg['attempts']
+    if ($attempts -lt 1) { $attempts = 1 }
+    for ($i = 1; $i -le $attempts; $i++) {
+        Invoke-Hook $url
+        # Invoke-Hook only writes the state file after a run that exited 0, so the state file
+        # holding this URL is exactly "the address was published".
+        $last = ''
+        if (Test-Path -LiteralPath $hookStatePath) { $last = (Get-Content -LiteralPath $hookStatePath -Raw).Trim() }
+        if ($last -eq $url) {
+            if ($i -gt 1) { Write-Log "hook succeeded on attempt $i for $url" }
+            return
+        }
+        if ($i -lt $attempts) {
+            Write-Log "hook attempt $i for $url failed - retrying in $([int]$hookCfg['retrySeconds'])s"
+            Start-Sleep -Seconds ([int]$hookCfg['retrySeconds'])
+        }
+    }
+    Write-Log "hook did not succeed for $url after $attempts attempts - will retry next scan"
+}
 function Get-HttpStatus([string]$uri) {
     # 0 means "no HTTP response at all" (connection refused / DNS / TLS failure).
     try {
@@ -314,6 +360,13 @@ function Get-HttpStatus([string]$uri) {
         if ($_.Exception.Response) { return [int]$_.Exception.Response.StatusCode }
         return 0
     }
+}
+function Test-TunnelAnswer([string]$url) {
+    # Does the Cloudflare edge answer for this address AT ALL? Any status counts: a 502/530
+    # means the tunnel exists and the origin behind it is the problem, which is a different
+    # fault from an address that has gone away (no response at all).
+    if (-not $url) { return $false }
+    return ((Get-HttpStatus $url.TrimEnd('/')) -ne 0)
 }
 function Test-TunnelHealthy([string]$url) {
     # A tunnel is only useful if the OUTSIDE can reach the service through it:
@@ -329,6 +382,23 @@ function Test-TunnelHealthy([string]$url) {
     if ($public -eq 0) { return $false }
     if ($public -ge 500 -and $local -gt 0 -and $local -lt 500) { return $false }
     return $true
+}
+function Wait-TunnelAnswer([string]$url, [int]$seconds) {
+    for ($i = 0; $i -lt [math]::Ceiling($seconds / 3); $i++) {
+        if (Test-TunnelAnswer $url) { return $true }
+        Start-Sleep -Seconds 3
+    }
+    return $false
+}
+function Wait-ServiceThroughTunnel([string]$url, [int]$seconds) {
+    # The hook re-checks the address from the public side, so running it while the service is
+    # still booting behind the tunnel only burns a whole scan interval. Wait for the service
+    # first, then let the hook do its job.
+    for ($i = 0; $i -lt [math]::Ceiling($seconds / 5); $i++) {
+        if (Test-TunnelHealthy $url) { return $true }
+        Start-Sleep -Seconds 5
+    }
+    return $false
 }
 function TooSoonToRestart {
     if (-not (Test-Path -LiteralPath $logPath)) { return $false }
@@ -419,12 +489,15 @@ if (-not $svc) {
             Send-Alert "[watchdog] the service was DOWN and the tunnel could not be started - manual attention needed"
             exit 1
         }
+        if (-not (Wait-TunnelAnswer $url ([int]$cfg['tunnelAnswerWaitSeconds']))) {
+            Write-Log "new tunnel announced $url but the edge does not answer for it yet - starting the service anyway"
+        }
         if ($cfg['urlFile'] -and -not $DryRun) { Set-Content -LiteralPath $cfg['urlFile'] -Value $url -Encoding ASCII }
     }
     Restart-Service $url
     Write-Log "repaired: service started again, tunnel $url"
     Send-Alert ("[watchdog] the service was DOWN - started it again. Public URL: " + $url)
-    if (Test-HookNeeded $url) { Invoke-Hook $url }
+    Publish-IfNeeded $url
     exit 0
 }
 
@@ -436,11 +509,14 @@ if (-not $tunnel) {
     Write-Log 'tunnel process is gone - restarting tunnel + service (restarting)'
     $newUrl = Start-Tunnel
     if (-not $newUrl) { Write-Log 'could not obtain a tunnel URL - giving up this round'; exit 1 }
+    if (-not (Wait-TunnelAnswer $newUrl ([int]$cfg['tunnelAnswerWaitSeconds']))) {
+        Write-Log "new tunnel announced $newUrl but the edge does not answer for it yet - starting the service anyway"
+    }
     if ($cfg['urlFile'] -and -not $DryRun) { Set-Content -LiteralPath $cfg['urlFile'] -Value $newUrl -Encoding ASCII }
     Restart-Service $newUrl
     Write-Log "repaired: tunnel $newUrl, service restarted"
     Send-Alert ("[watchdog] the tunnel had died - new public URL: " + $newUrl)
-    if (Test-HookNeeded $newUrl) { Invoke-Hook $newUrl }
+    Publish-IfNeeded $newUrl
     exit 0
 }
 
@@ -453,17 +529,25 @@ if (-not $url) {
 if (-not (Test-TunnelHealthy $url)) {
     if (TooSoonToRestart) { Write-Log 'tunnel unreachable but a restart happened recently - waiting'; exit 0 }
     Write-Log "tunnel process runs but $url does not answer - restarting tunnel + service (restarting)"
-    if (-not $DryRun) { Get-Process $tunnelCfg['processName'] -ErrorAction SilentlyContinue | Stop-Process -Force }
+    if (-not $DryRun) { Stop-TunnelProcesses }
     $newUrl = Start-Tunnel
     if (-not $newUrl) { Write-Log 'could not obtain a tunnel URL - giving up this round'; exit 1 }
+    if (-not (Wait-TunnelAnswer $newUrl ([int]$cfg['tunnelAnswerWaitSeconds']))) {
+        # An address the edge does not answer for is not an address. Recording it would hand a
+        # hostname that does not exist to the service and to the publish step, and the published
+        # page would point at nothing until the next scan.
+        Write-Log "the replacement tunnel announced $newUrl but the edge does not answer for it - not recording it, leaving the service alone"
+        Send-Alert ("[watchdog] the tunnel was replaced but " + $newUrl + " does not answer - nothing was republished, looking again next scan")
+        exit 0
+    }
     if ($cfg['urlFile'] -and -not $DryRun) { Set-Content -LiteralPath $cfg['urlFile'] -Value $newUrl -Encoding ASCII }
     Restart-Service $newUrl
     Write-Log "repaired: tunnel $newUrl, service restarted"
     Send-Alert ("[watchdog] the public URL stopped answering - repaired, new public URL: " + $newUrl)
-    if (Test-HookNeeded $newUrl) { Invoke-Hook $newUrl }
+    Publish-IfNeeded $newUrl
     exit 0
 }
 
 Write-Log "healthy: service pid $svc, tunnel $url"
-if (Test-HookNeeded $url) { Invoke-Hook $url }
+Publish-IfNeeded $url
 exit 0

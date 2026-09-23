@@ -35,13 +35,20 @@
   "_secretsFileFormat": "watchdog-secrets.json looks like: {\"botToken\": \"123456:ABC...\", \"chatId\": \"123456789\"} - keep it out of version control.",
 
   "_hook": "Optional command run after a repair, and again on any scan where the current public URL differs from the last one the hook succeeded with - use it to re-register a URL that changed (a hosted page pointing at a file, a webhook provider, an OAuth callback). {url} in args is replaced with the current public URL. The state file records a URL only after a hook run that exited 0, so a failure or a timeout is retried on the next scan.",
+  "_hookNote": "attempts/retrySeconds: a failed run is retried inside the same scan (default 3 x 20s) instead of waiting for the next one. waitForServiceSeconds: how long to wait for the service to answer through the tunnel before running the command at all (default: bootWaitSeconds); a publish that fails only because the service is still booting otherwise wastes a whole scan.",
   "hook": {
     "enabled": false,
     "command": "powershell.exe",
     "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\path\\to\\repoint-the-url.ps1"],
     "stateFile": "hook-state.txt",
-    "timeoutSeconds": 120
+    "timeoutSeconds": 120,
+    "attempts": 3,
+    "retrySeconds": 20,
+    "waitForServiceSeconds": 90
   },
+
+  "_tunnelAnswerWaitSeconds": "How long to wait for the edge to answer a replacement tunnel's address before recording it. An address the edge does not answer for is not recorded and the service is left alone (a second client started next to a live one announces an address and then dies).",
+  "tunnelAnswerWaitSeconds": 90,
 
   "_service": "The thing being kept alive.",
   "service": {

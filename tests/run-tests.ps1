@@ -57,6 +57,9 @@ function New-Sandbox([string]$name, [int]$port) {
         urlWaitSeconds            = 15
         bootWaitSeconds           = 15
         healthTimeoutSeconds      = 4
+        # the fake tunnel announces an address nothing answers for, so the edge check has to be
+        # short here; in production it is the bound on waiting for a replacement tunnel to come up
+        tunnelAnswerWaitSeconds   = 6
         service                   = @{
             port      = $port
             launcher  = (Join-Path $root 'fake-launcher.bat')
@@ -140,6 +143,10 @@ Stop-Sandbox $r2
 
 # --- T3: tunnel gone -> tunnel + service restarted with the new URL --------
 $r3 = New-Sandbox 't3' 45803
+$cfg3 = Get-Content -LiteralPath (Join-Path $r3 'watchdog-config.json') -Raw | ConvertFrom-Json
+# the fake tunnel announces an address nothing answers for, so keep the edge check short
+$cfg3 | Add-Member -NotePropertyName tunnelAnswerWaitSeconds -NotePropertyValue 6 -Force
+$cfg3 | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $r3 'watchdog-config.json') -Encoding UTF8
 Start-FakeService $r3 45803 | Out-Null
 Invoke-Watchdog $r3
 $log3 = Read-Log $r3
@@ -157,15 +164,30 @@ Record 'flapping guard blocks a second restart' ((@(LauncherRuns $r3).Count -eq 
        'no restart storm within the cooldown'
 Stop-Sandbox $r3
 
-# --- T5: tunnel alive but unreachable -> restart both ---------------------
+# --- T5: tunnel alive but the public side cannot reach the service ---------
+# The address the scan starts from is dead; the replacement client announces an address the
+# edge DOES answer for, which is what a real cloudflared tunnel does.
 $r5 = New-Sandbox 't5' 45805
 Start-FakeService $r5 45805 | Out-Null
-"INF url=https://t5-tunnel.test" | Set-Content -LiteralPath (Join-Path $r5 'tunnel.log') -Encoding ASCII
+Start-Process -FilePath 'powershell' -WindowStyle Hidden -ArgumentList `
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $r5 'respond.ps1'), '-Port', '45876', '-Status', '200' | Out-Null
+for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Milliseconds 500; if (Get-NetTCPConnection -LocalPort 45876 -State Listen -ErrorAction SilentlyContinue) { break } }
+$cfg5 = Get-Content -LiteralPath (Join-Path $r5 'watchdog-config.json') -Raw | ConvertFrom-Json
+$cfg5.tunnel.urlPattern = 'http://127\.0\.0\.1:[0-9]+'
+$cfg5 | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $r5 'watchdog-config.json') -Encoding UTF8
+("@echo off`r`n" + "echo INF url=http://127.0.0.1:45876>> `"%~dp0tunnel.log`"`r`n" +
+ "start `"`" /b ping -n 400 127.0.0.1 > nul`r`n") |
+    Set-Content -LiteralPath (Join-Path $r5 'fake-tunnel.bat') -Encoding ASCII
+"INF url=http://127.0.0.1:45899" | Set-Content -LiteralPath (Join-Path $r5 'tunnel.log') -Encoding ASCII
+"http://127.0.0.1:45899" | Set-Content -LiteralPath (Join-Path $r5 'public-url.txt') -Encoding ASCII
 Start-Process -FilePath 'ping' -ArgumentList '-n', '400', '127.0.0.1' -WindowStyle Hidden | Out-Null
 Start-Sleep -Seconds 2
 Invoke-Watchdog $r5
+$runs5 = @(LauncherRuns $r5)
 Record 'unreachable tunnel -> repaired' ((Read-Log $r5) -match 'does not answer - restarting') 'connection-level failure detected'
-Record 'repair replaced the stale URL file' ((UrlFile $r5) -eq 'https://t5-tunnel.test') 'URL file rewritten'
+Record 'the address the edge answers for is recorded' ((UrlFile $r5) -eq 'http://127.0.0.1:45876') "public-url.txt = $(UrlFile $r5)"
+Record 'service restarted with the replacement address' (($runs5.Count -ge 1) -and ($runs5[-1].Trim() -eq 'http://127.0.0.1:45876')) `
+       "launcher saw $(if ($runs5.Count) { $runs5[-1].Trim() } else { 'nothing' })"
 Stop-Sandbox $r5
 
 # --- T6: healthy scan, even when the service answers 404 -------------------
@@ -360,17 +382,22 @@ Stop-Sandbox $r16
 # --- hook: re-register the URL after it changes (T17-T22) -------------------
 # The hook is the answer to "the tunnel restarted, so every consumer of the old URL
 # is now talking to nothing". A local .bat stands in for the real publisher.
-function Set-Hook([string]$root, [bool]$enabled, [int]$exitCode) {
+function Set-Hook([string]$root, [bool]$enabled, [int]$exitCode, [string]$cmd = '', [int]$attempts = 1, [int]$retrySeconds = 1, [int]$waitForService = 0) {
     $bat = Join-Path $root 'fake-hook.bat'
-    ("@echo off`r`n" + "echo %1>> `"%~dp0hook-runs.txt`"`r`n" + "exit /b $exitCode`r`n") |
-        Set-Content -LiteralPath $bat -Encoding ASCII
+    if (-not $cmd) {
+        ("@echo off`r`n" + "echo %1>> `"%~dp0hook-runs.txt`"`r`n" + "exit /b $exitCode`r`n") |
+            Set-Content -LiteralPath $bat -Encoding ASCII
+    } else { $bat = $cmd }
     $cfg = Get-Content -LiteralPath (Join-Path $root 'watchdog-config.json') -Raw | ConvertFrom-Json
     $cfg | Add-Member -NotePropertyName hook -NotePropertyValue ([pscustomobject]@{
-        enabled        = $enabled
-        command        = $bat
-        args           = @('{url}')
-        stateFile      = (Join-Path $root 'hook-state.txt')
-        timeoutSeconds = 30
+        enabled                = $enabled
+        command                = $bat
+        args                   = @('{url}')
+        stateFile              = (Join-Path $root 'hook-state.txt')
+        timeoutSeconds         = 30
+        attempts               = $attempts
+        retrySeconds           = $retrySeconds
+        waitForServiceSeconds  = $waitForService
     }) -Force
     $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'watchdog-config.json') -Encoding UTF8
 }
@@ -444,6 +471,51 @@ Set-Hook $r22 $false 0
 Invoke-Watchdog $r22
 Record 'hook disabled -> nothing runs' (@(HookRuns $r22).Count -eq 0) 'opt-in stays opt-in'
 Stop-Sandbox $r22
+
+# --- T23: a replacement address nobody can reach is never recorded ---------
+# Real incident: a second client started next to a live one, announced a hostname, then died.
+# The address was recorded and republished, and the public page pointed at nothing.
+$r23 = New-Sandbox 't23' 45823
+Start-FakeService $r23 45823 | Out-Null
+$cfg23 = Get-Content -LiteralPath (Join-Path $r23 'watchdog-config.json') -Raw | ConvertFrom-Json
+$cfg23 | Add-Member -NotePropertyName tunnelAnswerWaitSeconds -NotePropertyValue 6 -Force
+$cfg23 | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $r23 'watchdog-config.json') -Encoding UTF8
+# the fake tunnel announces https://t23-tunnel.test, which nothing answers for
+"INF url=https://t23-dead.test" | Set-Content -LiteralPath (Join-Path $r23 'tunnel.log') -Encoding ASCII
+"https://t23-dead.test" | Set-Content -LiteralPath (Join-Path $r23 'public-url.txt') -Encoding ASCII
+Start-Process -FilePath 'ping' -ArgumentList '-n', '400', '127.0.0.1' -WindowStyle Hidden | Out-Null
+Start-Sleep -Seconds 2
+$before23 = @(LauncherRuns $r23).Count
+Invoke-Watchdog $r23
+Record 'an address the edge cannot answer for is not recorded' ((UrlFile $r23) -eq 'https://t23-dead.test') "public-url.txt = $(UrlFile $r23)"
+Record 'and the service is not restarted with it' (@(LauncherRuns $r23).Count -eq $before23) 'no restart onto a hostname that does not exist'
+Record 'the reason reaches the log' ((Read-Log $r23) -match 'the edge does not answer for it') 'visible, not silent'
+Stop-Sandbox $r23
+
+# --- T24: the hook retries inside one scan ---------------------------------
+# The publish step re-checks the address from the public side, so a failure caused by a service
+# that is still booting used to cost a whole scan interval. Now it is retried straight away.
+$r24 = New-HealthySandbox 't24' 45824 45877
+$bat24 = Join-Path $r24 'fake-hook-retry.bat'
+("@echo off`r`n" +
+ "echo %1>> `"%~dp0hook-runs.txt`"`r`n" +
+ "if not exist `"%~dp0attempt2.txt`" (type nul > `"%~dp0attempt2.txt`" & exit /b 1)`r`n" +
+ "if not exist `"%~dp0attempt3.txt`" (type nul > `"%~dp0attempt3.txt`" & exit /b 1)`r`n" +
+ "exit /b 0`r`n") | Set-Content -LiteralPath $bat24 -Encoding ASCII
+Set-Hook $r24 $true 0 -cmd $bat24 -attempts 3 -retrySeconds 1
+Invoke-Watchdog $r24
+Record 'a failed publish is retried inside the same scan' (@(HookRuns $r24).Count -eq 3) "hook runs: $(@(HookRuns $r24).Count)"
+Record 'a later attempt that succeeds is recorded' ((HookState $r24) -eq 'http://127.0.0.1:45877') "state = $(HookState $r24)"
+Record 'the retry that worked is named in the log' ((Read-Log $r24) -match 'hook succeeded on attempt 3') 'no silent retries'
+Stop-Sandbox $r24
+
+# --- T25: publishing stays in one place, and always after the service ------
+$src = Get-Content -LiteralPath $watchdog -Raw
+Record 'every publish goes through the helper' ((([regex]::Matches($src, 'Publish-IfNeeded \$')).Count -ge 4) -and `
+       (([regex]::Matches($src, 'Test-HookNeeded \$url\) \{ Invoke-Hook')).Count -eq 0)) 'no scattered hook calls left'
+Record 'the helper waits for the service through the tunnel' ($src -match 'Wait-ServiceThroughTunnel \$url \$wait') 'the wait is inside the helper'
+Record 'a replacement address is verified before it is used' ((([regex]::Matches($src, 'Wait-TunnelAnswer')).Count -ge 4) -and ($src -match 'Stop-TunnelProcesses')) `
+       'checked at every replacement site, with the old client stopped first'
 
 # --- cleanup ---------------------------------------------------------------
 Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue

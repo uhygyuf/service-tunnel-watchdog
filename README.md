@@ -85,7 +85,14 @@ OAuth callback. The watchdog cannot know how you re-register those, so it runs o
   successful run was given — so a tunnel you restarted by hand is republished on the next scan, at
   most five minutes later.
 * `stateFile` records a URL **only after a run that exited 0**. A hook that fails or hangs (it is
-  killed at `timeoutSeconds`) is retried on the next scan and the failure is logged.
+  killed at `timeoutSeconds`) is retried inside the same scan (`hook.attempts`, default 3, spaced by
+  `hook.retrySeconds`) and the failure is logged. Before the first attempt the watchdog waits up to
+  `hook.waitForServiceSeconds` for the service to answer through the tunnel, because a publish that
+  fails only because the service is still booting would otherwise cost a whole scan interval.
+* A **replacement tunnel address is verified before it is used**: the old client is stopped and waited
+  for, then the address it announces must be answered by the edge within `tunnelAnswerWaitSeconds`
+  (default 90). An address the edge does not answer for is not recorded and the service is left
+  alone — a second client started next to a live one announces an address and then dies.
 * Design the hook to be idempotent and fast: it may run on every URL change, and the watchdog waits
   for it before it exits.
 
@@ -154,6 +161,9 @@ window per interval, forever.
 | `healthTimeoutSeconds` | `20` | Timeout for the local and public health probes |
 | `hook.enabled` / `hook.command` / `hook.args` | off / — | Optional command run when the public URL changes; `{url}`, `{port}`, `{logfile}` are substituted |
 | `hook.stateFile` / `hook.timeoutSeconds` | `hook-state.txt` / `120` | File recording the last successfully published URL, and how long the hook may run |
+| `hook.attempts` / `hook.retrySeconds` | `3` / `20` | Attempts inside one scan before leaving it to the next scan, and the pause between them |
+| `hook.waitForServiceSeconds` | `bootWaitSeconds` | How long to wait for the service to answer through the tunnel before the first attempt |
+| `tunnelAnswerWaitSeconds` | `90` | How long a replacement tunnel's address may take to be answered by the edge before it is discarded |
 | `logFile` / `urlFile` / `offSwitch` | next to the script | Decision log, current-URL file, kill switch |
 
 **Watch the escaping in your JSON.** `"D:\Tools\n8n\x.log"` is a path; `"D:\Tools\n8n..."` with one
